@@ -1,0 +1,19 @@
+[TITLE]
+  msfrXS.json
+
+[MAT]
+  2
+  fuel moderator
+
+[BRANCH]
+  4
+  fuel     900 1 1 1 1
+  fuel    1200 2 1 1 2
+  moderator  900 1 1 2 3
+  moderator 1200 2 1 2 4
+
+[FILES]
+  1
+  jezebel_900.out   openmc
+  2
+  jezebel_1200.out   openmc
