@@ -1,18 +1,109 @@
 #!/usr/bin/env python3
-# This script extracts homogenized group constants from Serpent 2 or SCALE into
-# a JSON data file to be used with MoltresJsonMaterial.
+# This script extracts homogenized group constants from Serpent 2 or SCALE 
+# or OpenMC into a JSON data file to be used with MoltresJsonMaterial.
 import json
 import sys
 import argparse
 import numpy as np
-from pyne import serpent
+import importlib
+import openmc
+import openmc.mgxs as mgxs
+
+
+class openmc_xs:
+    def __init__(self, xs_filename, xs_ref_filename, file_num):
+        sp = openmc.StatePoint(xs_filename)
+        domain_dict = openmc_ref_modules[file_num].domain_dict
+        num_burn = 1 
+        num_uni = []
+        for k in sp.filters: 
+            v = sp.filters[k]
+            if isinstance(v, openmc.filter.CellFilter):
+                num_uni.append(v.bins[0])
+        num_temps = 1
+        self.xs_lib = {}
+        for i in range(num_burn):
+            self.xs_lib[i] = {}
+            for j in num_uni:
+                self.xs_lib[i][j-1] = {}
+                for k in range(num_temps):
+                    self.xs_lib[i][j-1][k] = {}
+                    self.xs_lib[i][j-1][k]["FISSXS"] = self.get_tallies_list(sp, domain_dict[j]["fissionxs"])
+
+    def get_tallies_list(self, sp, tally):
+        tally.load_from_statepoint(sp)
+        return list(tally.get_pandas_dataframe()["mean"])
+
+
+    def generate_openmc_tallies_xml(
+        energy_groups, delayed_groups, domains, domain_ids, tallies_file
+    ):
+        groups = mgxs.EnergyGroups()
+        groups.group_edges = np.array(energy_groups)
+        big_group = mgxs.EnergyGroups()
+        big_energy_group = [energy_groups[0], energy_groups[-1]]
+        big_group.group_edges = np.array(big_energy_group)
+        energy_filter = openmc.EnergyFilter(energy_groups)
+        domain_dict = {}
+        for id in domain_ids:
+            domain_dict[id] = {}
+        for domain, id in zip(domains, domain_ids):
+            domain_dict[id]["beta"] = mgxs.Beta(
+                domain=domain,
+                energy_groups=big_group,
+                delayed_groups=delayed_groups,
+                name=str(id) + "_beta",
+            )
+            domain_dict[id]["chi"] = mgxs.Chi(
+                domain=domain, groups=groups, name=str(id) + "_chi"
+            )
+            domain_dict[id]["chidelayed"] = mgxs.ChiDelayed(
+                domain=domain, energy_groups=groups, name=str(id) + "_chidelayed"
+            )
+            domain_dict[id]["decayrate"] = mgxs.DecayRate(
+                domain=domain,
+                energy_groups=big_group,
+                delayed_groups=delayed_groups,
+                name=str(id) + "_decayrate",
+            )
+            domain_dict[id]["scatterprobmatrix"] = mgxs.ScatterProbabilityMatrix(
+                domain=domain, groups=groups, name=str(id) + "_scatterprobmatrix"
+            )
+            domain_dict[id]["inversevelocity"] = mgxs.InverseVelocity(
+                domain=domain, groups=groups, name=str(id) + "_inversevelocity"
+            )
+            domain_dict[id]["fissionxs"] = mgxs.FissionXS(
+                domain=domain, groups=groups, name=str(id) + "_fissionxs"
+            )
+            domain_dict[id]["tally"] = openmc.Tally(name=str(id) + " tally")
+            domain_dict[id]["filter"] = openmc.CellFilter(domain)
+            domain_dict[id]["tally"].filters = [
+                domain_dict[id]["filter"],
+                energy_filter,
+            ]
+            domain_dict[id]["tally"].scores = [
+                "kappa-fission",
+                "nu-fission",
+                "absorption",
+                "scatter",
+            ]
+            tallies_file += domain_dict[id]["beta"].tallies.values()
+            tallies_file += domain_dict[id]["chi"].tallies.values()
+            tallies_file += domain_dict[id]["chidelayed"].tallies.values()
+            tallies_file += domain_dict[id]["decayrate"].tallies.values()
+            tallies_file += domain_dict[id]["scatterprobmatrix"].tallies.values()
+            tallies_file += domain_dict[id]["inversevelocity"].tallies.values()
+            tallies_file += domain_dict[id]["fissionxs"].tallies.values()
+            tallies_file.append(domain_dict[id]["tally"])
+        tallies_file.export_to_xml()
+        return domain_dict
 
 
 class scale_xs:
     """
         Python class that reads in a scale t16 file and organizes the cross
         section data into a numpy dictionary. Currently set up to read an
-        arbitrary number of energy groups, an arbitrart number of delayed
+        arbitrary number of energy groups, an arbitrary number of delayed
         neutron groups, an arbitrary number of identities, an arbitrary
         number of temperature branches, and an arbitrary number of burnups.
 
@@ -241,23 +332,30 @@ def read_input(fin):
             num_files = int(lines[k+1].split()[0])
             files = {}
             for i in range(num_files):
-                XS_in, XS_t = lines[k+2+i].split()
+                try:
+                    XS_in, XS_t, XS_ref = lines[k+2+i].split()
+                except: 
+                    XS_in, XS_t = lines[k+2+i].split()
                 if 'scale' in XS_t:
                     files[i] = scale_xs(XS_in)
-                elif 'serpent'in XS_t:
+                elif 'serpent' in XS_t:
                     files[i] = serpent_xs(XS_in)
+                elif 'openmc' in XS_t:
+                    files[i] = openmc_xs(XS_in, XS_ref, i+1)
                 else:
                     raise("XS data not understood\n \
-                          Please use: scale or serpent")
+                          Please use: scale, serpent, or openmc.")
+    print("mat dict",mat_dict)
     out_dict = {}
-    for entry in mat_dict:
-        out_dict[entry] = {'temp': mat_dict[entry]['temps']}
-        for i, t in enumerate(mat_dict[entry]['temps']):
-            L = mat_dict[entry]['file'][i] - 1
-            m = mat_dict[entry]['burn'][i] - 1
-            n = mat_dict[entry]['uni'][i] - 1
-            p = mat_dict[entry]['bran'][i] - 1
-            out_dict[entry][str(t)] = files[L].xs_lib[m][n][p]
+    for mat in mat_dict:
+        out_dict[mat] = {'temp': mat_dict[mat]['temps']}
+        for i, temp in enumerate(mat_dict[mat]['temps']):
+            # change to index by zero 
+            file_index = mat_dict[mat]['file'][i] - 1
+            burnup_index = mat_dict[mat]['burn'][i] - 1
+            uni_index = mat_dict[mat]['uni'][i] - 1
+            branch_index = mat_dict[mat]['bran'][i] - 1
+            out_dict[mat][str(temp)] = files[file_index].xs_lib[burnup_index][uni_index][branch_index]
     f.write(json.dumps(out_dict, sort_keys=True, indent=4))
 
 
@@ -272,6 +370,24 @@ if __name__ == '__main__':
                             file from Serpent 2 or SCALE, \
                             respectively')
     args = parser.parse_args()
+    # import relevant modules for each software
+    with open(sys.argv[1]) as f:
+        lines = f.readlines()
+        k = 0
+        for k, line in enumerate(lines):
+            if 'FILES' in line:
+                num_files = int(lines[k+1].split()[0])
+                files = {}
+                for i in range(num_files):
+                    try:
+                        XS_in, XS_t, XS_ref = lines[k+2+i].split()
+                    except: 
+                        XS_in, XS_t = lines[k+2+i].split()
+                    if 'openmc' in XS_t:
+                        openmc_ref_modules = {} 
+                        openmc_ref_modules[i+1] = importlib.import_module(XS_ref.replace(".py", ""))
+                    elif 'serpent' in XS_t:
+                        from pyne import serpent
 
     read_input(sys.argv[1])
 
